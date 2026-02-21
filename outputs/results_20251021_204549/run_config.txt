@@ -1,0 +1,33 @@
+# Sea-ice run configuration
+timestamp           : 20251021_204549
+input_file          : sea_ice.jpg
+image_size          : 4000x3000
+output_prefix       : out
+output_dir          : outputs\results_20251021_204549
+
+# Mode & thresholds
+segmentation        : watershed
+threshold_mode      : None
+sigma               : None
+edge_percentile     : None
+chroma_weight       : None
+canny_low           : None
+canny_high          : None
+
+# Pre/Post-processing
+blur_ksize          : 5
+close_ksize         : 5
+dilate_iter         : 1
+min_area            : 300
+mask_open           : 3
+mask_close          : 7
+marker_frac         : 0.4
+
+# Results
+contours_kept       : 18
+
+# Environment
+python_version      : 3.11.9 (tags/v3.11.9:de54cf5, Apr  2 2024, 10:12:12) [MSC v.1938 64 bit (AMD64)]
+platform            : Windows-10-10.0.26100-SP0
+opencv_version      : 4.12.0
+numpy_version       : 2.2.6

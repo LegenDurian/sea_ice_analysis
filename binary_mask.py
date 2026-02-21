@@ -1,7 +1,10 @@
+import csv
 import cv2 as cv
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+from pathlib import Path
+from PIL import Image
 
 class FloeSeparator:
     """This class is used to process a singular thermal sea ice image into segmented ice floes. 
@@ -91,15 +94,25 @@ class FloeSeparator:
 
         return labels_out, areas_px, centroids
 
-    def split_erode_dilate_small(self, mask, min_area=30, erode_min_size=500):
-        k3 = np.ones((3,3), np.uint8)
+    def split_erode_dilate_small(
+        self,
+        mask,
+        min_area=30,
+        erode_min_size=500,
+        meters_per_pixel=0.1218
+    ):
+        k3 = np.ones((3, 3), np.uint8)
 
         # Work from original mask components first
-        num0, labels0, stats0, cents0 = cv.connectedComponentsWithStats(mask, connectivity=8, ltype=cv.CV_32S)
+        num0, labels0, stats0, cents0 = cv.connectedComponentsWithStats(
+            mask, connectivity=8, ltype=cv.CV_32S
+        )
 
         labels_out = np.zeros_like(labels0, dtype=np.int32)
-        areas_px, centroids = [], []
+        areas_px, areas_m, centroids = [], [], []
         nid = 1
+
+        px_to_m2 = meters_per_pixel ** 2
 
         for i in range(1, num0):
             area0 = int(stats0[i, cv.CC_STAT_AREA])
@@ -110,8 +123,13 @@ class FloeSeparator:
 
             if area0 < erode_min_size:
                 rr = (comp > 0)
+                a_px = int(rr.sum())
+                a_m = a_px * px_to_m2
+
                 labels_out[rr] = nid
-                areas_px.append(int(rr.sum()))
+                areas_px.append(a_px)
+                areas_m.append(a_m)
+
                 ys, xs = np.nonzero(rr)
                 centroids.append((float(xs.mean()), float(ys.mean())))
                 nid += 1
@@ -120,26 +138,33 @@ class FloeSeparator:
             # Erode/dilate only for large components
             eroded = cv.erode(comp, k3, iterations=1)
             num_labels, labels = cv.connectedComponents(eroded)
-            # Dilate each label back separately, then stack (keeps identities)
+
+            # Dilate each label back separately
             for lbl in range(1, num_labels):
                 r = (labels == lbl).astype(np.uint8) * 255
                 d = cv.dilate(r, k3, iterations=1)
-                # Constrain by original mask to avoid leaking into sea
                 d = cv.bitwise_and(d, comp)
-                a = int((d > 0).sum())
-                if a >= min_area:
+
+                a_px = int((d > 0).sum())
+                if a_px >= min_area:
+                    a_m = a_px * px_to_m2
+
                     labels_out[d > 0] = nid
+                    areas_px.append(a_px)
+                    areas_m.append(a_m)
+
                     ys, xs = np.nonzero(d)
                     centroids.append((float(xs.mean()), float(ys.mean())))
-                    areas_px.append(a)
                     nid += 1
 
         # store on self
         self.labels_filtered = labels_out
-        self.areas_px = areas_px
+        self.areas_px = areas_px          # optional, but often useful
+        self.areas_m = areas_m            # area in m^2
         self.centroids = centroids
 
-        return labels_out, areas_px, centroids
+        return labels_out, areas_m, centroids
+
 
     def split_simple(self, mask, min_area=30):
         """
@@ -210,7 +235,7 @@ class FloeSeparator:
         overlay_numbered = cv.cvtColor(overlay_bgr, cv.COLOR_BGR2RGB)
         return overlay_numbered
 
-    def visualize_and_save(self, img_gray, img_rgb, mask, labels_filtered, centroids, areas_px,
+    def visualize(self, img_gray, img_rgb, mask, labels_filtered, centroids, areas_px,
                         color_seed=0, hist_path='size_distribution_hist.png'):
         """
         Make a compact 2x2 figure:
@@ -255,7 +280,7 @@ class FloeSeparator:
         # size distribution
         if len(areas_px) > 0:
             areas_px = np.asarray(areas_px, dtype=np.int32)
-            print(f"Area stats (pixels^2) — N={len(areas_px)}")
+            print(f"Area stats (m^2) — N={len(areas_px)}")
             print(f"  min: {areas_px.min():,}")
             print(f"  max: {areas_px.max():,}")
             print(f"  mean: {areas_px.mean():,.2f}")
@@ -263,9 +288,9 @@ class FloeSeparator:
 
             plt.figure(figsize=(8, 5))
             plt.hist(areas_px, bins='auto', edgecolor='k')
-            plt.xlabel('Area (pixels²)')
+            plt.xlabel('Area (m²)')
             plt.ylabel('Count')
-            plt.title('Floe Size Distribution (pixels²)')
+            plt.title('Floe Size Distribution (m²)')
             plt.tight_layout()
             plt.show()
         else:
@@ -437,17 +462,399 @@ def visualize_motion(img_gray, centroids1, matches,
         plt.savefig(save_path, dpi=150)
     plt.show()
 
+def compute_average_temps(arr, labels):
+    """
+    Compute average temperature per region (label).
+    
+    Parameters:
+        arr:    2D float32 thermal image (temperature per pixel)
+        labels: 2D int32 label map (0 = background, 1..N = floes)
+    
+    Returns:
+        avg_temps: dict mapping label_id → average_temperature
+        temp_list: list of averages in label order [label1_avg, label2_avg, ...]
+    """
+    if arr.shape != labels.shape:
+        raise ValueError("arr and labels must have the same shape!")
+
+    max_lbl = labels.max()
+    avg_temps = {}
+    temp_list = []
+
+    for lbl in range(1, max_lbl + 1):       # skip label 0 (background)
+        mask = (labels == lbl)
+        if np.any(mask):
+            mean_temp = float(arr[mask].mean())
+            avg_temps[lbl] = mean_temp
+            temp_list.append(mean_temp)
+        else:
+            avg_temps[lbl] = np.nan
+            temp_list.append(np.nan)
+
+    return avg_temps, temp_list
+
+def load_thermal_tif(path: Path) -> np.ndarray:
+    """Load a thermal .tif image into a NumPy array."""
+    img = Image.open(path)
+    arr = np.array(img)
+
+    print(f"[INFO] Loaded {path.name}")
+    print(f"       shape: {arr.shape}")
+    print(f"       dtype: {arr.dtype}")
+    print(f"       min:   {arr.min():.2f}")
+    print(f"       max:   {arr.max():.2f}")
+
+    return arr
+
+
+def visualize_thermal(arr: np.ndarray, title: str):
+    """Visualize a thermal image (float32 °C values)."""
+
+    # Clip percentile outliers for nicer visualization
+    vmin = np.percentile(arr, 1)
+    vmax = np.percentile(arr, 99)
+
+    plt.figure(figsize=(8, 6))
+    im = plt.imshow(arr, cmap="inferno", vmin=vmin, vmax=vmax)
+    cbar = plt.colorbar(im)
+    cbar.set_label("Temperature (°C)")
+
+    plt.title(title)
+    plt.axis("off")
+    plt.tight_layout()
+    plt.show()
+
+def plot_temperature_histogram(arr, bins=100, title="Temperature Histogram"):
+    """Plot a histogram of temperature values from a thermal array."""
+    
+    # Flatten array → 1D
+    temps = arr.flatten()
+
+    plt.figure(figsize=(8, 5))
+    plt.hist(temps, bins=bins, color='gray', edgecolor='black')
+    plt.xlabel("Temperature (°C)")
+    plt.ylabel("Frequency (pixel count)")
+    plt.title(title)
+    plt.grid(True, linestyle="--", alpha=0.4)
+    plt.tight_layout()
+    plt.show()
+
+def plot_floe_temperature_hist(temp_list, bins=20):
+    temps = np.array(temp_list)
+    temps = temps[~np.isnan(temps)]   # remove NaNs if any
+
+    plt.figure(figsize=(7,5))
+    plt.hist(temps, bins=bins, color='blue', alpha=0.7, edgecolor='black')
+    plt.xlabel("Average Temperature (°C)")
+    plt.ylabel("Floe Count")
+    plt.title("Histogram of Average Floe Temperatures")
+    plt.grid(True, linestyle='--', alpha=0.4)
+    plt.tight_layout()
+    plt.show()
+
+def export_floe_temperature_csv(arr, labels, areas_px, centroids, csv_path):
+    """
+    Export per-floe temperature statistics to a CSV file.
+
+    Parameters:
+        arr:        2D float array, thermal image (temperature per pixel)
+        labels:     2D int array, same shape as arr, 0 = background, 1..N = floe labels
+        areas_px:   list of areas in pixels; index (label-1) corresponds to label
+        centroids:  list of (cx, cy); index (label-1) corresponds to label
+        csv_path:   output CSV file path (str or Path)
+    """
+    if arr.shape != labels.shape:
+        raise ValueError("arr and labels must have the same shape!")
+
+    max_lbl = int(labels.max())
+
+    rows = []
+    for lbl in range(1, max_lbl + 1):
+        mask = (labels == lbl)
+        if not np.any(mask):
+            # no pixels with this label; skip
+            continue
+
+        temps = arr[mask]
+        avg_temp = float(temps.mean())
+        min_temp = float(temps.min())
+        max_temp = float(temps.max())
+        std_temp = float(temps.std())
+
+        # area and centroid from provided lists if available
+        if areas_px is not None and len(areas_px) >= lbl:
+            area_px_lbl = int(areas_px[lbl - 1])
+        else:
+            area_px_lbl = int(mask.sum())
+
+        if centroids is not None and len(centroids) >= lbl:
+            cx, cy = centroids[lbl - 1]
+        else:
+            ys, xs = np.nonzero(mask)
+            cx = float(xs.mean())
+            cy = float(ys.mean())
+
+        rows.append({
+            "floe_id": lbl,
+            "area_px": area_px_lbl,
+            "centroid_x": cx,
+            "centroid_y": cy,
+            "avg_temp": avg_temp,
+            "min_temp": min_temp,
+            "max_temp": max_temp,
+            "std_temp": std_temp,
+        })
+
+    fieldnames = [
+        "floe_id",
+        "area_px",
+        "centroid_x",
+        "centroid_y",
+        "avg_temp",
+        "min_temp",
+        "max_temp",
+        "std_temp",
+    ]
+
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    print(f"[INFO] Wrote {len(rows)} floe records to {csv_path}")
+
+def load_and_segment_sequence(folder, clahe_clip=1.5, clahe_grid=(8, 8), thresh_val=75,
+                              min_area=30, erode_min_size=500):
+    """
+    Load all images in `folder`, sort them by filename, and run segmentation
+    on each to get labels, areas, and centroids.
+
+    Returns:
+        img_grays:   list of grayscale images per frame
+        img_rgbs:    list of RGB images per frame
+        labels_list: list of 2D label arrays per frame
+        areas_list:  list of areas_px lists per frame
+        cents_list:  list of centroids lists per frame
+        paths:       list of image paths in order
+    """
+    folder = Path(folder)
+    if not folder.is_dir():
+        raise FileNotFoundError(f"Folder not found: {folder}")
+
+    # You can adjust extensions if needed (.JPG, .jpg, .png, etc.)
+    img_paths = sorted(list(folder.glob("*.JPG")))
+
+    if not img_paths:
+        raise FileNotFoundError(f"No images found in {folder}")
+
+    img_grays   = []
+    img_rgbs    = []
+    labels_list = []
+    areas_list  = []
+    cents_list  = []
+
+    for p in img_paths:
+        processor = FloeSeparator(str(p))
+        img_gray, img_rgb, mask = processor.preprocess(
+            clahe_clip=clahe_clip,
+            clahe_grid=clahe_grid,
+            thresh_val=thresh_val
+        )
+        # Use the same method you used in __main__
+        labels_filtered, areas_px, centroids = processor.split_erode_dilate_small(
+            mask,
+            min_area=min_area,
+            erode_min_size=erode_min_size
+        )
+
+        img_grays.append(img_gray)
+        img_rgbs.append(img_rgb)
+        labels_list.append(labels_filtered)
+        areas_list.append(areas_px)
+        cents_list.append(centroids)
+
+    return img_grays, img_rgbs, labels_list, areas_list, cents_list, img_paths
+
+def track_floes_over_sequence(labels_list, areas_list, cents_list,
+                              max_centroid_dist=40, min_iou=0.05):
+    """
+    Use match_floes between consecutive frames to build floe tracks over time.
+
+    Returns:
+        track_centroids: dict track_id -> list of (frame_index, cx, cy)
+        num_frames:      total number of frames
+    """
+    num_frames = len(labels_list)
+    if num_frames < 2:
+        raise ValueError("Need at least 2 frames for motion tracking.")
+
+    # track_assignments[f][i] = track_id of floe i in frame f (i is index into cents_list[f])
+    track_assignments = [dict() for _ in range(num_frames)]
+    track_centroids   = {}
+
+    # Initialize tracks from frame 0: each floe becomes a new track
+    track_id_counter = 0
+    for i, (cx, cy) in enumerate(cents_list[0]):
+        tid = track_id_counter
+        track_id_counter += 1
+        track_assignments[0][i] = tid
+        track_centroids[tid] = [(0, cx, cy)]
+
+    # Propagate through subsequent frames
+    for f in range(num_frames - 1):
+        labels1    = labels_list[f]
+        centroids1 = cents_list[f]
+        areas1     = areas_list[f]
+
+        labels2    = labels_list[f + 1]
+        centroids2 = cents_list[f + 1]
+        areas2     = areas_list[f + 1]
+
+        matches, unmatched1, unmatched2 = match_floes(
+            labels1, centroids1, areas1,
+            labels2, centroids2, areas2,
+            max_centroid_dist=max_centroid_dist,
+            min_iou=min_iou
+        )
+
+        # Propagate tracks from frame f to f+1
+        for idx1, idx2, dx, dy, dist, iou in matches:
+            if idx1 not in track_assignments[f]:
+                # This floe didn't have a track (e.g., appeared mid-sequence), skip
+                continue
+            tid = track_assignments[f][idx1]
+            track_assignments[f + 1][idx2] = tid
+            cx2, cy2 = centroids2[idx2]
+            track_centroids[tid].append((f + 1, cx2, cy2))
+
+        # Any unmatched floe in frame f+1 is a new track
+        for idx2 in unmatched2:
+            cx2, cy2 = centroids2[idx2]
+            tid = track_id_counter
+            track_id_counter += 1
+            track_assignments[f + 1][idx2] = tid
+            track_centroids[tid] = [(f + 1, cx2, cy2)]
+
+    return track_centroids, num_frames
+
+def compute_avg_velocity_for_full_tracks(track_centroids, num_frames, dt_seconds=2.0):
+    """
+    For each track that spans ALL frames, compute average velocity vector and direction.
+
+    Returns:
+        results: list of dict with keys:
+            track_id, avg_vx_px_s, avg_vy_px_s, speed_px_s, direction_deg, points
+    """
+    results = []
+
+    for tid, points in track_centroids.items():
+        # points: list of (frame_index, cx, cy)
+        frames_present = {fr for fr, _, _ in points}
+        # Require that this floe appears in every frame exactly once
+        if len(frames_present) != num_frames:
+            continue
+
+        # Sort by frame index
+        points_sorted = sorted(points, key=lambda x: x[0])
+
+        dxs, dys = [], []
+        for (f0, x0, y0), (f1, x1, y1) in zip(points_sorted[:-1], points_sorted[1:]):
+            # assuming f1 = f0 + 1
+            dxs.append(x1 - x0)
+            dys.append(y1 - y0)
+
+        if not dxs:
+            continue
+
+        mean_dx = float(np.mean(dxs))
+        mean_dy = float(np.mean(dys))
+
+        vx = mean_dx / dt_seconds
+        vy = mean_dy / dt_seconds
+
+        # Image coordinates: x right, y down.
+        # If you want conventional math angle (y up), flip sign of vy in atan2.
+        speed = float(np.hypot(vx, vy))
+        direction_rad = float(np.arctan2(-vy, vx))  # -vy to treat up as positive
+        direction_deg = float(np.degrees(direction_rad))
+
+        results.append({
+            "track_id": tid,
+            "avg_vx_px_s": vx,
+            "avg_vy_px_s": vy,
+            "speed_px_s": speed,
+            "direction_deg": direction_deg,
+            "points": points_sorted,
+        })
+
+    return results
+
+def plot_floe_trajectories(base_img_gray,
+                           track_centroids,
+                           track_ids=None,
+                           title="Floe trajectories",
+                           save_path=None):
+    """
+    Plot trajectories for one or more floe tracks on top of a grayscale image.
+
+    Parameters:
+        base_img_gray: 2D array, grayscale image to use as background (e.g. frame 0)
+        track_centroids: dict track_id -> list of (frame_index, cx, cy)
+        track_ids: list of track_ids to plot. If None, plot all tracks in track_centroids.
+        title: plot title
+        save_path: if not None, save figure to this path
+    """
+    if track_ids is None:
+        track_ids = sorted(track_centroids.keys())
+
+    plt.figure(figsize=(8, 6))
+    plt.imshow(base_img_gray, cmap='gray')
+    plt.title(title)
+    plt.axis('off')
+
+    # Color cycle
+    colors = plt.cm.tab20(np.linspace(0, 1, max(20, len(track_ids))))
+
+    for k, tid in enumerate(track_ids):
+        if tid not in track_centroids:
+            continue
+
+        points = track_centroids[tid]
+        # sort by frame index
+        points_sorted = sorted(points, key=lambda x: x[0])
+        frames = [p[0] for p in points_sorted]
+        xs     = [p[1] for p in points_sorted]
+        ys     = [p[2] for p in points_sorted]
+
+        col = colors[k % len(colors)]
+
+        # Plot trajectory line
+        plt.plot(xs, ys, '-', marker='o', markersize=3, linewidth=1.5,
+                 color=col, label=f"track {tid} (frames {frames[0]}–{frames[-1]})")
+
+        # Mark start and end more clearly
+        plt.scatter(xs[0], ys[0], s=40, color=col, edgecolors='black', linewidths=1.0)
+        plt.scatter(xs[-1], ys[-1], s=40, color=col, marker='X', edgecolors='black', linewidths=1.0)
+
+    if len(track_ids) <= 15:
+        plt.legend(loc='upper right', fontsize=8)
+
+    plt.tight_layout()
+    if save_path is not None:
+        plt.savefig(save_path, dpi=150)
+        print(f"[INFO] Saved trajectory plot to {save_path}")
+    plt.show()
 
 if __name__ == "__main__":
-    img1_path = 'sea_ice_analysis/sea_ice_thermal.jpg'
-    img2_path = 'sea_ice_analysis/sea_ice_thermal2.jpg'
+    img1_path = 'thermal_timelapse\DJI_20250218031618_0007_T.JPG'
+    img2_path = 'thermal_timelapse\DJI_20250218031620_0008_T.JPG'
 
     processor1= FloeSeparator(img1_path)
     processor2 = FloeSeparator(img2_path)
 
     # run preprocess to populate self.img_gray, self.img_rgb, self.mask
-    img_gray, img_rgb, mask = processor1.preprocess(clahe_clip=1.5, clahe_grid=(8,8), thresh_val=70)
-    img_gray2, img_rgb2, mask2 = processor2.preprocess(clahe_clip=1.5, clahe_grid=(8,8), thresh_val=70)
+    img_gray, img_rgb, mask = processor1.preprocess(clahe_clip=1.5, clahe_grid=(8,8), thresh_val=75)
+    img_gray2, img_rgb2, mask2 = processor2.preprocess(clahe_clip=1.5, clahe_grid=(8,8), thresh_val=75)
 
     # select one of the splitting methods:
     # labels_filtered, areas_px, centroids = processor1.split_simple(mask, min_area=30) # no erosion, just use binary mask
@@ -455,8 +862,34 @@ if __name__ == "__main__":
     labels_filtered, areas_px, centroids = processor1.split_erode_dilate_small(mask, min_area=30) # 1px erosion/dilation
     labels_filtered2, areas_px2, centroids2 = processor2.split_erode_dilate_small(mask2, min_area=30)
 
+    # Folder containing thermal TIFFs — this directory is inside your package
+    thermal_dir = Path(__file__).parent / "thermal_tif"
+
+    if not thermal_dir.exists():
+        raise FileNotFoundError(f"Folder not found: {thermal_dir}")
+
+    tif_files = sorted(thermal_dir.glob("*.tif"))
+
+    print(f"[INFO] Found {len(tif_files)} TIFF files in {thermal_dir}\n")
+
+    # for tif_path in tif_files:
+    #     arr = load_thermal_tif(tif_path)
+    #     arr = np.rot90(arr, 2)
+    #     visualize_thermal(arr, title=tif_path.name)
+
+    arr = load_thermal_tif(tif_files[0])
+    arr = np.rot90(arr, 2)
+    plot_temperature_histogram(arr, bins=100, title=f"Temperature Histogram: {tif_files[0].name}")
+    visualize_thermal(arr, title=tif_files[0].name)
+
+    avg_temps, temp_list = compute_average_temps(arr, labels_filtered)
+    plot_floe_temperature_hist(temp_list)
+
+    csv_out = "floe_temperature_stats.csv"
+    export_floe_temperature_csv(arr, labels_filtered, areas_px, centroids, csv_out)
+
     # below code visualizes and saves outputs
-    # processor1.visualize_and_save(img_gray, img_rgb, mask, labels_filtered, centroids, areas_px)
+    processor1.visualize(img_gray, img_rgb, mask, labels_filtered, centroids, areas_px)
 
     # match floes between frame 1 and 2
     matches, unmatched1, unmatched2 = match_floes(
@@ -479,7 +912,7 @@ if __name__ == "__main__":
     visualize_motion(img_gray, centroids, matches,
                      save_path='floe_motion_vectors.png')
 
-
+    '''erm'''
     # visible_path = 'sea_ice_analysis/sea_ice.jpg'
     # vis_bgr = cv.imread(visible_path)
     # if vis_bgr is None:
@@ -507,3 +940,59 @@ if __name__ == "__main__":
     # plt.tight_layout()
     # plt.savefig('visible_overlay_preview.png', dpi=150)
     # plt.show()
+
+    timelapse_folder = "thermal_timelapse"
+
+    # 1) Load and segment all frames
+    img_grays, img_rgbs, labels_list, areas_list, cents_list, img_paths = load_and_segment_sequence(
+        timelapse_folder,
+        clahe_clip=1.5,
+        clahe_grid=(8, 8),
+        thresh_val=75,
+        min_area=30,
+        erode_min_size=500
+    )
+
+    print(f"[INFO] Loaded and segmented {len(img_paths)} frames.")
+
+    # 2) Track floes over sequence
+    track_centroids, num_frames = track_floes_over_sequence(
+        labels_list,
+        areas_list,
+        cents_list,
+        max_centroid_dist=40,
+        min_iou=0.05
+    )
+
+    # 3) Compute average velocity for floes present in ALL frames
+    dt_seconds = 2.0  # images taken every 2 s
+    full_track_results = compute_avg_velocity_for_full_tracks(
+        track_centroids,
+        num_frames,
+        dt_seconds=dt_seconds
+    )
+
+    full_track_ids = [res["track_id"] for res in full_track_results]
+    subset_ids = full_track_ids[40:45]
+
+    plot_floe_trajectories(
+        base_img_gray=img_grays[0],
+        track_centroids=track_centroids,
+        track_ids=subset_ids,
+        title="Trajectories of selected floes",
+        save_path="floe_trajectories_selected.png"
+    )
+
+    print(f"[INFO] Found {len(full_track_results)} floes tracked across all {num_frames} frames.\n")
+
+    for res in full_track_results:
+        tid = res["track_id"]
+        vx  = res["avg_vx_px_s"]
+        vy  = res["avg_vy_px_s"]
+        spd = res["speed_px_s"]
+        ang = res["direction_deg"]
+        print(f"Track {tid}: "
+              f"avg vx = {vx:.3f} px/s, "
+              f"avg vy = {vy:.3f} px/s, "
+              f"speed = {spd:.3f} px/s, "
+              f"direction = {ang:.1f}°")

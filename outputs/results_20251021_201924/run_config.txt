@@ -1,0 +1,22 @@
+# Sea-ice Canny run configuration
+timestamp           : 20251021_201924
+input_file          : sea_ice.jpg
+image_size          : 4000x3000
+output_prefix       : out
+output_dir          : outputs\results_20251021_201924
+
+# Thresholding
+threshold_mode      : global
+sigma               : 0.33
+edge_percentile     : None
+canny_low           : 82
+canny_high          : 163
+
+# Pre/Post-processing
+blur_ksize          : 5
+close_ksize         : 5
+dilate_iter         : 1
+min_area            : 200
+
+# Results
+contours_kept       : 413
