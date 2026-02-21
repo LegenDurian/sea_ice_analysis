@@ -1,1 +1,12 @@
 .venv/
+__pycache__/
+*.pyc
+
+# Generated outputs (not source data)
+outputs/dataset_tiles/
+outputs/watershed_out/
+clahe_output.jpg
+figure_2x2.png
+floe_motion_vectors.png
+floe_trajectories_*.png
+floe_temperature_stats.csv
